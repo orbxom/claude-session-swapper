@@ -105,24 +105,60 @@ refresh_token() {
 
 bar() {
   # bar <pct>: 10 cells, █ per full 10%, ▌ for a half cell, spaces after.
-  local pct="${1%.*}" full half i out=""
+  # Cells are counted, never measured with ${#out}: under LC_CTYPE=C each █ is
+  # three bytes, and a byte count would cut the bar short.
+  local pct="${1%.*}" full half i cells out=""
   [ "$pct" -gt 100 ] && pct=100
   [ "$pct" -lt 0 ] && pct=0
   full=$((pct / 10)); half=$(( (pct % 10) >= 5 ? 1 : 0 ))
   [ "$full" -eq "$BAR_WIDTH" ] && half=0
   for ((i = 0; i < full; i++)); do out+="█"; done
   [ "$half" -eq 1 ] && out+="▌"
-  while [ "${#out}" -lt "$BAR_WIDTH" ]; do out+=" "; done
+  cells=$((full + half))
+  for ((i = cells; i < BAR_WIDTH; i++)); do out+=" "; done
   printf '[%s]' "$out"
+}
+
+# iso_to_epoch <iso8601>: prints epoch seconds, or fails. Parsed with jq rather
+# than date, because `date -d` is GNU-only and `date -j -f` is BSD-only while jq
+# (already a hard dependency) behaves the same on both. Fractional seconds are
+# dropped and a ±HH:MM offset normalised to Z, neither of which
+# fromdateiso8601 accepts.
+iso_to_epoch() {
+  jq -rn --arg s "$1" '
+    $s
+    | sub("\\.[0-9]+"; "")
+    | sub("(?<h>[+-][0-9]{2}):(?<m>[0-9]{2})$"; "\(.h)\(.m)")
+    | if test("Z$") then fromdateiso8601
+      elif test("[+-][0-9]{4}$") then
+        (.[0:19] + "Z" | fromdateiso8601) as $t
+        | (.[19:20] + "1" | tonumber) as $sign
+        | ((.[20:22] | tonumber) * 3600 + (.[22:24] | tonumber) * 60) as $off
+        | $t - ($sign * $off)
+      else (. + "Z" | fromdateiso8601) end
+    | floor' 2>/dev/null
+}
+
+# fmt_epoch <epoch> <strftime fmt>: GNU date spells this `-d @N`, BSD `-r N`.
+# Probe once and remember; never branch on uname.
+_DATE_KIND=""
+fmt_epoch() {
+  if [ -z "$_DATE_KIND" ]; then
+    if date -d @0 +%s >/dev/null 2>&1; then _DATE_KIND=gnu; else _DATE_KIND=bsd; fi
+  fi
+  if [ "$_DATE_KIND" = gnu ]; then date -d "@$1" "+$2"; else date -r "$1" "+$2"; fi
 }
 
 fmt_reset() {
   # fmt_reset <iso8601>: "8:10pm" if within 24h, else "Thu 1pm". Empty in → empty out.
+  # %p, not GNU's %P: BSD strftime prints a bare "P" for %P, so lowercase in bash.
   local iso="$1" epoch s
   [ -n "$iso" ] && [ "$iso" != "null" ] || return 0
-  epoch="$(date -d "$iso" +%s 2>/dev/null)" || { echo "$iso"; return 0; }
-  if [ $((epoch - NOW)) -lt 86400 ]; then s="$(date -d "@$epoch" +%-I:%M%P)"
-  else s="$(date -d "@$epoch" '+%a %-I:%M%P')"; fi
+  epoch="$(iso_to_epoch "$iso")" || true
+  [[ "$epoch" =~ ^-?[0-9]+$ ]] || { echo "$iso"; return 0; }
+  if [ $((epoch - NOW)) -lt 86400 ]; then s="$(fmt_epoch "$epoch" '%-I:%M%p')"
+  else s="$(fmt_epoch "$epoch" '%a %-I:%M%p')"; fi
+  s="${s/AM/am}"; s="${s/PM/pm}"   # only the meridiem: %a must keep its capital
   echo "${s/:00/}"
 }
 
@@ -152,12 +188,14 @@ render_usage() {
     (.limits // [])[]
     | [.kind, (.scope.model.display_name // ""), (.percent // 0), (.resets_at // "")]
     | map(tostring) | join("\u001f")')
-  local used limit
+  # `|| true`: no extra usage means jq prints nothing and read returns 1, which
+  # under set -e would abort the whole batch mid-render.
+  local used="" limit=""
   read -r used limit < <(echo "$json" | jq -r '
     .extra_usage // empty
     | select(.is_enabled == true)
     | (pow(10; (.decimal_places // 2))) as $d
-    | "\(.used_credits / $d) \(.monthly_limit / $d)"')
+    | "\(.used_credits / $d) \(.monthly_limit / $d)"') || true
   if [ -n "${used:-}" ]; then
     printf '    %-15s $%.2f of $%.2f\n' "extra usage" "$used" "$limit"
   fi
@@ -183,7 +221,7 @@ for name in "${NAMES[@]}"; do
 
   dir="$(profile_dir "$name")"
   if [ "$name" = "$CUR" ]; then
-    creds="$(json_read "$(creds_file)" | jq '.claudeAiOauth // {}')"
+    creds="$(creds_read | jq '.claudeAiOauth // {}')"
   else
     creds="$(json_read "$dir/login.json" | jq '.credentials // {}')"
   fi

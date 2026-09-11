@@ -40,6 +40,7 @@ assert_exit_code() {
 new_sandbox() {
   SANDBOX="$(mktemp -d)"
   export CSWAP_HOME="$SANDBOX/cswap" CLAUDE_CONFIG_DIR="$SANDBOX/claude"
+  export CSWAP_CREDS_STORE=file   # never reach for the real keychain in tests
   mkdir -p "$CLAUDE_CONFIG_DIR"
 }
 
@@ -214,7 +215,7 @@ test_switch_refuses_unsaved_login_without_discard() {
   run work --discard
   assert_exit_code "$RC" 0 || return 1
   assert_eq "$(live_uuid)" "u1" || return 1
-  assert_eq "$(profile_list | wc -l)" "1" "no profile created for the discarded login" || return 1
+  assert_eq "$(profile_list | wc -l | tr -d '[:space:]')" "1" "no profile created for the discarded login" || return 1
 }
 
 test_switch_when_logged_out_just_restores() {

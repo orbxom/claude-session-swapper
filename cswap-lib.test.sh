@@ -36,11 +36,17 @@ assert_exit_code() {
 
 # --- fixtures ----------------------------------------------------------------
 
+# file_mode <path>: the octal mode, from BSD stat or GNU stat. `stat -c` is
+# GNU-only and `stat -f` BSD-only, so try one and fall back to the other.
+file_mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+
+
 # new_sandbox: temp CSWAP_HOME + CLAUDE_CONFIG_DIR in SANDBOX. Runs in the
 # caller's shell (not $(...)) so the exports stick; caller traps cleanup.
 new_sandbox() {
   SANDBOX="$(mktemp -d)"
   export CSWAP_HOME="$SANDBOX/cswap" CLAUDE_CONFIG_DIR="$SANDBOX/claude"
+  export CSWAP_CREDS_STORE=file   # keychain backend has its own tests below
   mkdir -p "$CLAUDE_CONFIG_DIR"
 }
 
@@ -96,9 +102,9 @@ test_json_read_missing_is_empty_object() {
 test_json_write_atomic_sets_mode_600() {
   new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
   echo '{"a":1}' | json_write_atomic "$SANDBOX/sub/out.json"
-  assert_eq "$(stat -c %a "$SANDBOX/sub/out.json")" "600" "mode" || return 1
+  assert_eq "$(file_mode "$SANDBOX/sub/out.json")" "600" "mode" || return 1
   assert_eq "$(jq -c . "$SANDBOX/sub/out.json")" '{"a":1}' "content" || return 1
-  assert_eq "$(ls -A "$SANDBOX/sub" | wc -l)" "1" "no temp left behind" || return 1
+  assert_eq "$(ls -A "$SANDBOX/sub" | wc -l | tr -d '[:space:]')" "1" "no temp left behind" || return 1
 }
 
 test_identity_empty_when_logged_out() {
@@ -113,8 +119,8 @@ test_capture_writes_login_json() {
   make_live u1 one@example.com
   capture_all work || return 1
   local f="$CSWAP_HOME/profiles/work/login.json"
-  assert_eq "$(stat -c %a "$f")" "600" "mode" || return 1
-  assert_eq "$(stat -c %a "$CSWAP_HOME/profiles/work")" "700" "dir mode" || return 1
+  assert_eq "$(file_mode "$f")" "600" "mode" || return 1
+  assert_eq "$(file_mode "$CSWAP_HOME/profiles/work")" "700" "dir mode" || return 1
   assert_eq "$(jq -r '.credentials.accessToken' "$f")" "at-u1" "token" || return 1
   assert_eq "$(jq -r '.account.emailAddress' "$f")" "one@example.com" "email" || return 1
   assert_eq "$(jq -r '.userID' "$f")" "uid-u1" "userID" || return 1
@@ -143,7 +149,7 @@ test_restore_replaces_login_and_preserves_other_keys() {
   assert_eq "$(jq -r '.userID' "$cj")" "uid-u1" "userID restored" || return 1
   assert_eq "$(jq -r '.numStartups' "$cj")" "42" "other keys kept" || return 1
   assert_eq "$(jq -c '.projects' "$cj")" '{"/x":{"allowedTools":[]}}' "projects kept" || return 1
-  assert_eq "$(stat -c %a "$creds")" "600" "creds mode" || return 1
+  assert_eq "$(file_mode "$creds")" "600" "creds mode" || return 1
 }
 
 test_restore_into_missing_live_files_creates_them() {
@@ -191,6 +197,117 @@ test_valid_profile_name() {
   valid_profile_name "a b" && { echo "  FAIL accepted space"; return 1; }
   valid_profile_name "" && { echo "  FAIL accepted empty"; return 1; }
   return 0
+}
+
+# --- keychain store ----------------------------------------------------------
+
+# use_stub_keychain: a fake `security` over a file in SANDBOX, speaking the two
+# subcommands Claude Code (and so cswap) uses. Nothing here ever touches the
+# real login keychain.
+use_stub_keychain() {
+  sandboxed_or_die
+  unset CSWAP_CREDS_STORE
+  export CSWAP_SECURITY="$SANDBOX/security" KEYCHAIN_DB="$SANDBOX/keychain"
+  CSWAP_SECURITY_BIN="$CSWAP_SECURITY"
+  _CREDS_STORE=""
+  cat > "$CSWAP_SECURITY" <<'STUB'
+#!/usr/bin/env bash
+# item file is "$KEYCHAIN_DB.<service>"; absent file = no such item (exit 44).
+cmd="$1"; shift
+svc=""; acct=""; hex=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s) svc="$2"; shift 2 ;;
+    -a) acct="$2"; shift 2 ;;
+    -X) hex="$2"; shift 2 ;;
+    -w|-U) shift ;;
+    *) shift ;;
+  esac
+done
+f="$KEYCHAIN_DB.$svc"
+case "$cmd" in
+  find-generic-password)
+    [ -f "$f" ] || { echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2; exit 44; }
+    printf '%s' "$(cat "$f")" ;;
+  add-generic-password)
+    printf '%s' "$hex" | perl -ne 's/([0-9a-f]{2})/print chr hex $1/gie' > "$f" ;;
+  *) exit 2 ;;
+esac
+STUB
+  chmod +x "$CSWAP_SECURITY"
+}
+
+stub_keychain_put() { printf '%s' "$2" > "$KEYCHAIN_DB.$1"; }
+
+test_keychain_service_name_follows_the_config_dir() {
+  local plain hashed
+  plain="$(unset CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR; keychain_service)"
+  assert_eq "$plain" "Claude Code-credentials" "default install" || return 1
+  hashed="$(unset CLAUDE_SECURESTORAGE_CONFIG_DIR; CLAUDE_CONFIG_DIR=/tmp/elsewhere keychain_service)"
+  local want="Claude Code-credentials-$(printf '%s' /tmp/elsewhere | sha256_hex | cut -c1-8)"
+  assert_eq "$hashed" "$want" "relocated install" || return 1
+  assert_eq "$(CLAUDE_SECURESTORAGE_CONFIG_DIR= CLAUDE_CONFIG_DIR=/tmp/elsewhere keychain_service)" \
+    "Claude Code-credentials" "empty securestorage dir wins" || return 1
+}
+
+test_keychain_account_falls_back_on_odd_usernames() {
+  assert_eq "$(USER=ada.lovelace-1 keychain_account)" "ada.lovelace-1" "plain name" || return 1
+  assert_eq "$(USER='a b' keychain_account)" "claude-code-user" "name with a space" || return 1
+}
+
+test_store_prefers_a_live_keychain_item_over_the_file() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  use_stub_keychain
+  make_live u-file file@example.com          # a file exists...
+  assert_eq "$(creds_store)" "file" "no keychain item yet" || return 1
+  _CREDS_STORE=""
+  stub_keychain_put "$(keychain_service)" '{"claudeAiOauth":{"accessToken":"at-kc"}}'
+  assert_eq "$(creds_store)" "keychain" "keychain item wins" || return 1
+  assert_eq "$(creds_read | jq -r '.claudeAiOauth.accessToken')" "at-kc" || return 1
+}
+
+test_store_is_keychain_when_logged_out_on_a_mac() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  use_stub_keychain
+  rm -f "$(creds_file)"
+  assert_eq "$(creds_store)" "keychain" || return 1
+  assert_eq "$(creds_read)" "{}" "no item reads as empty" || return 1
+}
+
+test_capture_and_restore_through_the_keychain() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  use_stub_keychain
+  local svc; svc="$(keychain_service)"
+  # A keychain login that also carries MCP and trusted-device tokens.
+  stub_keychain_put "$svc" '{"claudeAiOauth":{"accessToken":"at-u1","refreshToken":"rt-u1","expiresAt":1},"mcpOAuth":{"plugin:slack|abc":{"accessToken":"slack-token"}},"trustedDeviceToken":"tdt-1"}'
+  cat > "$CLAUDE_CONFIG_DIR/.claude.json" <<'EOF'
+{"numStartups":42,"oauthAccount":{"accountUuid":"u1","emailAddress":"one@example.com","organizationName":"Org u1"},"userID":"uid-u1"}
+EOF
+  rm -f "$(creds_file)"
+  capture_all personal || return 1
+  assert_eq "$(jq -r '.credentials.accessToken' "$CSWAP_HOME/profiles/personal/login.json")" "at-u1" "captured from keychain" || return 1
+
+  # a different account is live; restoring must put u1 back
+  stub_keychain_put "$svc" '{"claudeAiOauth":{"accessToken":"at-u2"},"mcpOAuth":{"plugin:slack|abc":{"accessToken":"slack-token"}},"trustedDeviceToken":"tdt-1"}'
+  _CREDS_STORE=""
+  restore_all personal || return 1
+  assert_eq "$(creds_read | jq -r '.claudeAiOauth.accessToken')" "at-u1" "token restored" || return 1
+  assert_eq "$(creds_read | jq -r '.mcpOAuth["plugin:slack|abc"].accessToken')" "slack-token" "mcp tokens kept" || return 1
+  assert_eq "$(creds_read | jq -r '.trustedDeviceToken')" "tdt-1" "trusted device token kept" || return 1
+  assert_eq "$(slot_login_identity)" "u1" "account restored" || return 1
+  [ ! -e "$(creds_file)" ] || { echo "  FAIL wrote a plaintext credentials file next to a keychain login"; return 1; }
+}
+
+test_capture_fails_when_the_keychain_has_no_login() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  use_stub_keychain
+  stub_keychain_put "$(keychain_service)" '{"mcpOAuth":{}}'
+  cat > "$CLAUDE_CONFIG_DIR/.claude.json" <<'EOF'
+{"numStartups":42}
+EOF
+  local rc=0; capture_all work 2>/dev/null || rc=$?
+  assert_exit_code "$rc" 1 || return 1
+  [ ! -e "$CSWAP_HOME/profiles/work/login.json" ] || { echo "  FAIL wrote a profile while logged out"; return 1; }
 }
 
 # --- runner ------------------------------------------------------------------

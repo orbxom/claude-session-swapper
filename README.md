@@ -36,7 +36,14 @@ still has 5-hour budget left before you start a long task.
 | fzf    | picker only | `cswap` with no arguments |
 | curl   | `--limits` only | talks to the usage endpoint |
 | claude | `new` only | runs `claude auth logout` / `claude auth login` |
-| GNU date | `--limits` only | formats reset times (`date -d`) |
+| security | macOS only | reads and writes the login Keychain item (ships with macOS) |
+
+Linux and macOS both work; nothing here needs GNU coreutils. On macOS you do
+need a newer bash than the 3.2 Apple ships:
+
+```bash
+brew install bash jq fzf
+```
 
 ## Install
 
@@ -98,17 +105,26 @@ see `token expired (open claude to refresh)`.
 
 ## How it works
 
-1. **Two live files.** Claude Code keeps OAuth tokens in
-   `~/.claude/.credentials.json` under `claudeAiOauth`, and the account identity
-   in `~/.claude.json` under `oauthAccount` and `userID`. Both files hold other
-   things too (MCP tokens, UI state, per-project settings).
+1. **Two live stores.** Claude Code keeps the OAuth tokens under
+   `claudeAiOauth` in a JSON blob that lives either in the macOS login Keychain
+   (item `Claude Code-credentials`, the default on a Mac) or in
+   `~/.claude/.credentials.json` (Linux, and macOS when the Keychain is
+   unavailable); the account identity sits in `~/.claude.json` under
+   `oauthAccount` and `userID`. `cswap` looks for a live Keychain item first and
+   falls back to the file, so it follows whichever one Claude Code is using —
+   `cswap status` prints which. Both stores hold other things too (MCP tokens,
+   the trusted-device token, UI state, per-project settings); `cswap` rewrites
+   the login keys and nothing else.
 2. **A profile is a directory** at `~/.config/cswap/profiles/<name>/` holding
    one JSON file per *slot*. The only slot today is `login.json`: the three keys
    above plus a `savedAt` timestamp. Files are 0600, directories 0700.
-3. **Capture** reads the three keys out of the live files and writes
+3. **Capture** reads the three keys out of the live stores and writes
    `login.json` atomically (temp file in the same dir, then `mv`).
-4. **Restore** merges the three keys back into the live files with `jq`, leaving
-   every other key untouched, again atomically.
+4. **Restore** merges the three keys back with `jq`, leaving every other key
+   untouched — atomically for the file, and for the Keychain with the same
+   in-place `security add-generic-password -U` that Claude Code itself uses, so
+   the item keeps its ACL and the tokens beside the login survive. `cswap` never
+   deletes the Keychain item.
 5. **Active profile is derived, not stored.** The live `accountUuid` is
    compared with each profile's saved one. There is no pointer file to go stale
    when you log in or out outside `cswap`.
@@ -149,10 +165,9 @@ real locations.
 - Only the login is swapped. Settings, plugins, and history are shared. A
   settings/plugins slot is planned; the slot contract in `cswap-lib.sh` is
   where it goes.
-- `--limits` needs GNU `date -d`. On macOS install coreutils or expect raw ISO
-  timestamps in the reset column.
-- The usage and token endpoints are the ones Claude Code itself calls, read
-  out of the binary. They are not a published API and may change.
+- The usage and token endpoints, and the Keychain service and account names,
+  are the ones Claude Code itself uses, read out of the binary. They are not a
+  published API and may change.
 - If two profiles hold the same account, only the first alphabetically shows ●.
 
 ## License

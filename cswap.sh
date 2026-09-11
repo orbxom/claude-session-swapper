@@ -11,9 +11,22 @@
 #        cswap -l|--limits [name…]  usage limits for every profile
 set -euo pipefail
 
-# readlink -f: the installed command is a symlink in ~/.local/bin, and the lib
-# lives next to the real file, not next to the link.
-_CSWAP_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# The installed command is a symlink in ~/.local/bin, and the lib lives next to
+# the real file, not next to the link. `readlink -f` resolves that in one step
+# on GNU and on macOS 12.3+; older BSD readlink has no -f, so walk the chain.
+resolve_link() {
+  local p="$1" target
+  readlink -f "$p" 2>/dev/null && return 0
+  while [ -L "$p" ]; do
+    target="$(readlink "$p")"
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+  done
+  echo "$p"
+}
+_CSWAP_DIR="$(cd "$(dirname "$(resolve_link "${BASH_SOURCE[0]}")")" && pwd)"
 _CSWAP_LIB="$_CSWAP_DIR/cswap-lib.sh"
 [ -r "$_CSWAP_LIB" ] || { echo "cswap-lib.sh missing next to $(basename "$0")" >&2; exit 1; }
 source "$_CSWAP_LIB"
@@ -151,6 +164,7 @@ cmd_status() {
     echo "unsaved login: $(live_email)"
   else
     echo "not logged in"
+    echo "  credentials: $(creds_location)" >&2
     exit 1
   fi
 }

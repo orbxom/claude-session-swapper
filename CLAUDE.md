@@ -34,9 +34,14 @@ cswap.sh ──source──▶ cswap-lib.sh ◀──source── cswap-limits.s
    └── -l/--limits ──exec───────────────────────────┘
 ```
 
-Live files (Claude Code's, never created by us except on restore):
+Live state (Claude Code's, never created by us except on restore):
 
-- `${CLAUDE_CONFIG_DIR:-~/.claude}/.credentials.json` → we own `.claudeAiOauth` only.
+- The credential blob → we own `.claudeAiOauth` only. It lives in **one of two
+  stores**, chosen at runtime by `creds_store()`: the macOS login Keychain
+  (service `Claude Code-credentials`, account `$USER`) when an item is there,
+  else `${CLAUDE_CONFIG_DIR:-~/.claude}/.credentials.json`. Read and write it
+  only through `creds_read` / `creds_write`; nothing outside cswap-lib.sh may
+  name `creds_file`.
 - `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`) → we own `.oauthAccount` and `.userID` only.
 
 Saved state: `${CSWAP_HOME:-~/.config/cswap}/profiles/<name>/login.json`
@@ -49,10 +54,12 @@ The *active* profile is derived on every call by matching the live
 
 ### Enforced by cswap-lib.sh
 
-1. **Restore touches only the login keys.** Every other key in both live files
-   survives byte-for-byte in meaning (`test_restore_replaces_login_and_preserves_other_keys`).
-   `.credentials.json` also carries MCP OAuth tokens; `.claude.json` carries
-   ~90 keys of UI state. Never `>` a live file; always `jq … | json_write_atomic`.
+1. **Restore touches only the login keys.** Every other key in both live stores
+   survives byte-for-byte in meaning (`test_restore_replaces_login_and_preserves_other_keys`,
+   `test_capture_and_restore_through_the_keychain`). The credential blob also
+   carries MCP OAuth tokens and `trustedDeviceToken`; `.claude.json` carries
+   ~90 keys of UI state. Never `>` a live file; always `jq … | json_write_atomic`
+   (file) or `jq … | creds_write` (either store).
 2. **Every write is atomic and 0600.** `json_write_atomic` writes a same-dir
    temp file, chmods, then `mv`s (`test_json_write_atomic_sets_mode_600`).
 3. **Capture refuses when logged out** rather than writing an empty profile
@@ -60,6 +67,14 @@ The *active* profile is derived on every call by matching the live
 4. **Slots are the only extension point.** `cswap.sh` calls `capture_all` /
    `restore_all` / `active_profile`; it never names `login`. A new slot adds
    four `slot_<name>_*` functions and appends to `SLOTS`.
+4b. **The Keychain item is updated, never replaced.** `keychain_write` uses
+   `security add-generic-password -U` with the payload as `-X` hex, exactly as
+   Claude Code 2.1.268 does, so the item keeps its ACL and cswap is
+   indistinguishable from Claude Code as a writer. cswap never calls
+   `delete-generic-password`: the item also holds MCP and trusted-device tokens.
+   The hex goes in argv because `security` has no usable alternative — its stdin
+   password prompt truncates at 128 bytes and `security -i` mangles a line this
+   long — and macOS shows a process's arguments only to its own user.
 5. **Profile names match `^[A-Za-z0-9_-]+$`** so a name can never escape
    `profiles/` (`test_valid_profile_name`, exit 2 at the CLI).
 
@@ -98,10 +113,22 @@ The *active* profile is derived on every call by matching the live
 ## When making changes
 
 - Tests use env seams (`CSWAP_HOME`, `CLAUDE_CONFIG_DIR`, `CSWAP_CURL`,
-  `CSWAP_NOW`) and a stub `claude` on PATH. Fixture helpers must run in the
+  `CSWAP_NOW`, `CSWAP_SECURITY`, `CSWAP_CREDS_STORE`) and a stub `claude` on
+  PATH. **No test may touch the real login Keychain**: every sandbox pins
+  `CSWAP_CREDS_STORE=file`, and the keychain tests point `CSWAP_SECURITY` at a
+  stub (`use_stub_keychain`). Fixture helpers must run in the
   caller's shell, not `$(…)`, or their exports are lost — the first test run
   of this repo wrote real tokens into `~/.config/cswap/profiles/alpha` for
   exactly that reason.
+- **No GNU-only flags.** Linux and macOS are both first-class, so `date -d`,
+  `stat -c`, `readlink -f` and `%P` are all out. Where the two userlands differ,
+  probe the capability at runtime and cache the answer (`fmt_epoch` in
+  cswap-limits.sh) — never branch on `uname`. Parsing that jq can do (ISO 8601
+  timestamps: `iso_to_epoch`) belongs in jq, which behaves the same everywhere.
+  Count characters yourself rather than with `${#s}`: under `LC_CTYPE=C` that
+  counts bytes and the usage bars come out short. In tests, file modes go
+  through the `file_mode` helper, and BSD `wc -l` pads its count, so pipe
+  through `tr -d '[:space:]'` before comparing.
 - Keep README "How it works" and this file's invariants in sync with the code.
 - Commit subjects: `cswap: …`, `limits: …`, `docs: …`, `tests: …`; body says
   why, ends with a `Tests: N shell` line.

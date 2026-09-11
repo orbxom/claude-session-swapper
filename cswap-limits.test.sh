@@ -45,6 +45,11 @@ assert_exit_code() {
 
 # --- fixtures ----------------------------------------------------------------
 
+# file_mode <path>: the octal mode, from BSD stat or GNU stat. `stat -c` is
+# GNU-only and `stat -f` BSD-only, so try one and fall back to the other.
+file_mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+
+
 # Fixed clock: 2026-09-08T21:00:00Z. Session resets 4h10m later (same day in
 # the 24h window); weekly resets in ~2 days.
 FIXED_NOW=1788901200
@@ -54,6 +59,7 @@ EXP_PAST_MS=$(( (FIXED_NOW - 3600) * 1000 ))
 new_sandbox() {
   SANDBOX="$(mktemp -d)"
   export CSWAP_HOME="$SANDBOX/cswap" CLAUDE_CONFIG_DIR="$SANDBOX/claude" CSWAP_NOW="$FIXED_NOW"
+  export CSWAP_CREDS_STORE=file   # never reach for the real keychain in tests
   export CSWAP_CURL="$SANDBOX/curl" CURL_LOG="$SANDBOX/curl.log" TZ=UTC
   mkdir -p "$CLAUDE_CONFIG_DIR"
   : > "$CURL_LOG"
@@ -198,7 +204,7 @@ test_expired_stashed_token_is_refreshed_and_written_back() {
   assert_eq "$(jq -r .credentials.refreshToken "$f")" "rt-refreshed" || return 1
   assert_eq "$(jq -r .credentials.expiresAt "$f")" "$(( (FIXED_NOW + 28800) * 1000 ))" "expiresAt" || return 1
   assert_eq "$(jq -r .account.accountUuid "$f")" "u2" "account kept" || return 1
-  assert_eq "$(stat -c %a "$f")" "600" || return 1
+  assert_eq "$(file_mode "$f")" "600" || return 1
 }
 
 test_expired_active_token_is_not_refreshed() {
@@ -273,6 +279,45 @@ test_label_mapping() {
   assert_eq "$(label_for weekly_scoped Opus)" "7d Opus" || return 1
   assert_eq "$(label_for weekly_scoped "")" "7d scoped" || return 1
   assert_eq "$(label_for something_new "")" "something_new" || return 1
+}
+
+test_fmt_reset_formats() {
+  # Reset times used to come out as raw ISO on any BSD userland: fmt_reset asked
+  # GNU `date -d`, and even with BSD's `date -r` the %P (lowercase am/pm) in the
+  # format string is a GNU extension. Pin both shapes.
+  eval "$(sed -n '/^iso_to_epoch() {/,/^}/p;/^_DATE_KIND=/p;/^fmt_epoch() {/,/^}/p;/^fmt_reset() {/,/^}/p' "$SCRIPT_UNDER_TEST")"
+  local NOW="$FIXED_NOW" TZ=UTC
+  export TZ
+  assert_eq "$(fmt_reset '2026-09-09T01:10:00.073810+00:00')" "1:10am" "within 24h" || return 1
+  assert_eq "$(fmt_reset '2026-09-10T18:00:00.073830+00:00')" "Thu 6pm" "beyond 24h" || return 1
+  assert_eq "$(fmt_reset '2026-09-09T01:10:00Z')" "1:10am" "plain Z" || return 1
+  assert_eq "$(fmt_reset '2026-09-09T11:10:00+10:00')" "1:10am" "non-UTC offset" || return 1
+  assert_eq "$(fmt_reset '')" "" "empty in, empty out" || return 1
+  assert_eq "$(fmt_reset 'null')" "" "null in, empty out" || return 1
+  assert_eq "$(fmt_reset 'not-a-date')" "not-a-date" "unparseable falls through" || return 1
+}
+
+test_renders_when_extra_usage_disabled() {
+  # An account without extra usage makes the jq query print nothing, `read`
+  # return 1 and, under set -e, the whole batch die after the first profile.
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_profile a-one u1 one@example.com "$EXP_FUTURE_MS"
+  make_profile b-two u2 two@example.com "$EXP_FUTURE_MS"
+  # Prefix assignment, not export: the stub curl reads USAGE_JSON from the
+  # environment, and this must not leak into the next test's stub.
+  USAGE_JSON='{"limits":[{"kind":"session","percent":85,"resets_at":"2026-09-09T01:10:00.073810+00:00","scope":null}],"extra_usage":{"is_enabled":false}}' run
+  assert_exit_code "$RC" 0 || return 1
+  assert_contains "$OUT" "5h session" "limits still render" || return 1
+  assert_not_contains "$OUT" "extra usage" "no extra usage line" || return 1
+  assert_contains "$OUT" "b-two   two@example.com" "batch did not stop at the first profile" || return 1
+}
+
+test_bar_width_is_locale_independent() {
+  # ${#out} counts bytes under LC_CTYPE=C, and each block glyph is three of
+  # them, so a byte-measured bar came out a third of its width.
+  local out
+  out="$(LC_ALL=C bash -c "BAR_WIDTH=10; $(sed -n '/^bar() {/,/^}/p' "$SCRIPT_UNDER_TEST"); bar 46")"
+  assert_eq "$out" "[████▌     ]" "C locale" || return 1
 }
 
 # --- runner ------------------------------------------------------------------
