@@ -67,9 +67,14 @@ Commands:
   -l, --limits    Show 5h/7d usage windows for each profile (see cswap-limits.sh).
   -h, --help      Show this help and exit.
 
+Swaps the Claude desktop app's signed-in account alongside the CLI's, when
+that app is installed. It must be quit while you switch. Everything else in
+its data directory stays put.
+
 Environment:
   CSWAP_HOME         Where profiles live (default ~/.config/cswap).
   CLAUDE_CONFIG_DIR  Claude Code config dir (default ~/.claude).
+  CSWAP_NO_DESKTOP   Set to leave the Claude desktop app alone.
 
 Exits 0 on success, 130 on cancel (fzf Esc / declined confirm), 1 on error,
 2 on bad arguments.
@@ -84,6 +89,7 @@ check_name() {
 
 cmd_switch() {
   local name="$1" discard="$2" cur live_id
+  preflight_all || exit 1
   profile_exists "$name" || { echo "no such profile: $name (see: cswap list)" >&2; exit 1; }
   cur="$(active_profile)"
   live_id="$(slot_login_identity)"
@@ -105,6 +111,7 @@ cmd_switch() {
 
 cmd_add() {
   local name="$1" force="$2"
+  preflight_all || exit 1
   [ -n "$(slot_login_identity)" ] || { echo "not logged in to claude (run: claude auth login)" >&2; exit 1; }
   if profile_exists "$name" && [ "$force" -ne 1 ]; then
     echo "profile already exists: $name (use --force to overwrite)" >&2
@@ -116,6 +123,7 @@ cmd_add() {
 
 cmd_new() {
   local name="$1" cur live_id
+  preflight_all || exit 1
   profile_exists "$name" && { echo "profile already exists: $name" >&2; exit 1; }
   need claude
   cur="$(active_profile)"
@@ -160,6 +168,7 @@ cmd_status() {
   cur="$(active_profile)"
   if [ -n "$cur" ]; then
     echo "$cur ($(profile_email "$cur"))"
+    warn_out_of_sync
   elif [ -n "$(slot_login_identity)" ]; then
     echo "unsaved login: $(live_email)"
   else
@@ -167,6 +176,16 @@ cmd_status() {
     echo "  credentials: $(creds_location)" >&2
     exit 1
   fi
+}
+
+# warn_out_of_sync: a slot signed in as somebody else is worth saying out loud
+# — it means half your session is on the wrong account.
+warn_out_of_sync() {
+  local s
+  while read -r s; do
+    [ -n "$s" ] || continue
+    echo "note: the $s login is a different account (switch again to line them up)" >&2
+  done < <(slots_out_of_sync)
 }
 
 cmd_rm() {

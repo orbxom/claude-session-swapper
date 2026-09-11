@@ -60,6 +60,7 @@ new_sandbox() {
   SANDBOX="$(mktemp -d)"
   export CSWAP_HOME="$SANDBOX/cswap" CLAUDE_CONFIG_DIR="$SANDBOX/claude" CSWAP_NOW="$FIXED_NOW"
   export CSWAP_CREDS_STORE=file   # never reach for the real keychain in tests
+  export CSWAP_DESKTOP_DIR="$SANDBOX/desktop" CSWAP_DESKTOP_RUNNING=0   # no desktop app unless a test makes one
   export CSWAP_CURL="$SANDBOX/curl" CURL_LOG="$SANDBOX/curl.log" TZ=UTC
   mkdir -p "$CLAUDE_CONFIG_DIR"
   : > "$CURL_LOG"

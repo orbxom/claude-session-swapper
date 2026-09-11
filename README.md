@@ -1,6 +1,7 @@
 # cswap — Claude Code account swapper
 
-Swaps the Claude Code login between saved profiles so one machine can run
+Swaps the Claude Code login — and the Claude desktop app's — between saved
+profiles so one machine can run
 `claude` as a personal account or a work account. Everything else under
 `~/.claude` — settings, plugins, history, MCP tokens — stays shared. Also shows
 every profile's usage limits in one place without switching.
@@ -115,23 +116,35 @@ see `token expired (open claude to refresh)`.
    `cswap status` prints which. Both stores hold other things too (MCP tokens,
    the trusted-device token, UI state, per-project settings); `cswap` rewrites
    the login keys and nothing else.
-2. **A profile is a directory** at `~/.config/cswap/profiles/<name>/` holding
-   one JSON file per *slot*. The only slot today is `login.json`: the three keys
-   above plus a `savedAt` timestamp. Files are 0600, directories 0700.
-3. **Capture** reads the three keys out of the live stores and writes
+2. **The desktop app has its own login.** `Claude.app` is an Electron shell
+   around claude.ai, so it authenticates with a `sessionKey` cookie rather than
+   the OAuth blob. `cswap` swaps that too: its `Cookies` database, the three
+   account keys in `config.json`, and this account's entry in
+   `ant-device-registry.json`. The encrypted values move verbatim — they are
+   encrypted with an app-wide key, not a per-account one, so `cswap` never
+   decrypts anything and never prompts for Keychain access. **Quit the app
+   before switching**: Electron rewrites its login on exit, so `cswap` refuses
+   while it is running. Set `CSWAP_NO_DESKTOP=1` to switch only the CLI login.
+3. **A profile is a directory** at `~/.config/cswap/profiles/<name>/` holding
+   one JSON file per *slot*: `login.json` for Claude Code, `desktop.json` for
+   the desktop app when it is installed. Files are 0600, directories 0700.
+4. **Capture** reads the three keys out of the live stores and writes
    `login.json` atomically (temp file in the same dir, then `mv`).
-4. **Restore** merges the three keys back with `jq`, leaving every other key
+5. **Restore** merges the three keys back with `jq`, leaving every other key
    untouched — atomically for the file, and for the Keychain with the same
    in-place `security add-generic-password -U` that Claude Code itself uses, so
    the item keeps its ACL and the tokens beside the login survive. `cswap` never
    deletes the Keychain item.
-5. **Active profile is derived, not stored.** The live `accountUuid` is
+6. **Active profile is derived, not stored.** The live `accountUuid` is
    compared with each profile's saved one. There is no pointer file to go stale
    when you log in or out outside `cswap`.
-6. **Slots are the extension point.** `cswap-lib.sh` has a `SLOTS` array and a
+7. **Slots are the extension point.** `cswap-lib.sh` has a `SLOTS` array and a
    four-function contract per slot (capture, restore, identity, identity_of).
    Swapping settings or plugins later means adding a slot; `cswap.sh` never
-   names one.
+   names one. A slot may also define a `preflight` that refuses the whole
+   command before anything is written — that is how the desktop slot stops a
+   switch while the app is open, rather than leaving half your session on one
+   account and half on the other.
 
 ## Files
 
@@ -162,9 +175,15 @@ real locations.
   checked with `--limits`) in a month will need `claude auth login` again:
   switch to it, log in, and the next switch away saves the fresh tokens.
 - `cswap` does not check for running `claude` sessions. See *Switching* above.
+  It does check for the desktop app, and refuses to switch while it is open.
+- The desktop app's conversation cache and window state are not per-account.
+  Only the login is swapped, so the sidebar may briefly show the previous
+  account's history until it refreshes.
 - Only the login is swapped. Settings, plugins, and history are shared. A
   settings/plugins slot is planned; the slot contract in `cswap-lib.sh` is
   where it goes.
+- The desktop app's Keychain item, service names and config keys were read out
+  of the app, not a published API, and may change.
 - The usage and token endpoints, and the Keychain service and account names,
   are the ones Claude Code itself uses, read out of the binary. They are not a
   published API and may change.

@@ -27,10 +27,11 @@ To run a subset, pass a prefix: `bash cswap.test.sh switch` runs every
 ```
 cswap.sh ──source──▶ cswap-lib.sh ◀──source── cswap-limits.sh
    │                     │                          ▲
-   │  add/new/list/      │  SLOTS=(login)           │
-   │  status/rm/switch   │  slot_login_{capture,    │
+   │  add/new/list/      │  SLOTS=(login desktop)   │
+   │  status/rm/switch   │  slot_<s>_{capture,      │
    │  picker             │    restore,identity,     │
-   │                     │    identity_of}          │
+   │                     │    identity_of,          │
+   │                     │    preflight?}           │
    └── -l/--limits ──exec───────────────────────────┘
 ```
 
@@ -44,8 +45,19 @@ Live state (Claude Code's, never created by us except on restore):
   name `creds_file`.
 - `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`) → we own `.oauthAccount` and `.userID` only.
 
-Saved state: `${CSWAP_HOME:-~/.config/cswap}/profiles/<name>/login.json`
-(`{credentials, account, userID, savedAt}`), 0600 in 0700 dirs.
+The Claude desktop app (`~/Library/Application Support/Claude`, an Electron
+shell around claude.ai) has its own, unrelated login — a web session, not the
+OAuth blob:
+
+- `Cookies` (SQLite) → the `sessionKey` cookie for `.claude.ai`.
+- `config.json` → we own `lastKnownAccountUuid`, `oauth:tokenCache`,
+  `oauth:tokenCacheV2` only (~50 other keys of UI state stay).
+- `ant-device-registry.json` → one entry per account UUID; we merge, never replace.
+
+Saved state: `${CSWAP_HOME:-~/.config/cswap}/profiles/<name>/<slot>.json`, 0600
+in 0700 dirs — `login.json` (`{credentials, account, userID, savedAt}`) and,
+when the desktop app is installed, `desktop.json`
+(`{accountUuid, config, registry, cookies, savedAt}`, cookies base64).
 
 The *active* profile is derived on every call by matching the live
 `accountUuid` against each saved profile. Nothing stores "current".
@@ -65,8 +77,11 @@ The *active* profile is derived on every call by matching the live
 3. **Capture refuses when logged out** rather than writing an empty profile
    (`test_capture_fails_when_logged_out`).
 4. **Slots are the only extension point.** `cswap.sh` calls `capture_all` /
-   `restore_all` / `active_profile`; it never names `login`. A new slot adds
-   four `slot_<name>_*` functions and appends to `SLOTS`.
+   `restore_all` / `preflight_all` / `active_profile` / `slots_out_of_sync`; it
+   never names `login` or `desktop`. A new slot adds four `slot_<name>_*`
+   functions (plus an optional `_preflight`) and appends to `SLOTS`. `SLOTS[0]`
+   decides which profile is active, so the Claude Code login stays
+   authoritative.
 4b. **The Keychain item is updated, never replaced.** `keychain_write` uses
    `security add-generic-password -U` with the payload as `-X` hex, exactly as
    Claude Code 2.1.268 does, so the item keeps its ACL and cswap is
@@ -97,6 +112,28 @@ The *active* profile is derived on every call by matching the live
     login fails after logout (`test_new_reports_failed_login`).
 11. **No ANSI colour.** Glyphs only (`●`, `·`, `›`), same as wt.
 
+### Enforced by the desktop slot
+
+4c. **A missing, never-signed-in or opted-out desktop app is a no-op, not an
+   error** (`test_desktop_slot_is_inert_without_the_app`,
+   `test_desktop_capture_skips_an_app_never_signed_in`), and a profile saved
+   without a desktop half still switches the CLI login
+   (`test_desktop_restore_skips_a_profile_saved_without_it`). `CSWAP_NO_DESKTOP`
+   turns the slot off entirely.
+4d. **Nothing is swapped while the app is running.** Electron holds cookies in
+   memory and rewrites them on quit, so `slot_desktop_preflight` refuses and
+   `preflight_all` aborts the command before any slot has written
+   (`test_switch_refuses_while_the_desktop_app_runs`). That is what the
+   preflight hook exists for: a half-switched session is worse than no switch.
+4e. **The encrypted blobs are moved, never opened.** `oauth:tokenCache[V2]` and
+   the cookie values are encrypted under the app-wide `Claude Safe Storage`
+   key, not a per-account one, so they round-trip verbatim. cswap must never
+   read that keychain key — doing so would put a GUI authorization prompt in
+   the middle of a switch.
+4f. **A stale `Cookies-journal`/`-wal` is removed on restore**, or SQLite
+   replays rows from the login we just replaced
+   (`test_desktop_restore_clears_a_stale_cookie_journal`).
+
 ### Enforced by cswap-limits.sh
 
 12. **The live token is never refreshed by cswap** — a running `claude` owns it
@@ -113,8 +150,11 @@ The *active* profile is derived on every call by matching the live
 ## When making changes
 
 - Tests use env seams (`CSWAP_HOME`, `CLAUDE_CONFIG_DIR`, `CSWAP_CURL`,
-  `CSWAP_NOW`, `CSWAP_SECURITY`, `CSWAP_CREDS_STORE`) and a stub `claude` on
-  PATH. **No test may touch the real login Keychain**: every sandbox pins
+  `CSWAP_NOW`, `CSWAP_SECURITY`, `CSWAP_CREDS_STORE`, `CSWAP_DESKTOP_DIR`,
+  `CSWAP_DESKTOP_RUNNING`) and a stub `claude` on PATH. Every sandbox points
+  `CSWAP_DESKTOP_DIR` at a path that does not exist, so a test can never see
+  the real desktop app — without that, the whole suite fails on a machine
+  where it happens to be open. **No test may touch the real login Keychain**: every sandbox pins
   `CSWAP_CREDS_STORE=file`, and the keychain tests point `CSWAP_SECURITY` at a
   stub (`use_stub_keychain`). Fixture helpers must run in the
   caller's shell, not `$(…)`, or their exports are lost — the first test run

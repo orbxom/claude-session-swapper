@@ -9,7 +9,7 @@
 #   - claude_dir / creds_file / claude_json_file : the live Claude Code files
 #   - creds_read / creds_write     : the OAuth blob, from the Keychain or the file
 #   - json_write_atomic <path>     : stdin -> temp file (0600) -> mv over path
-#   - slot registry (SLOTS) + the `login` slot
+#   - slot registry (SLOTS) + the `login` and `desktop` slots
 #   - profile_* helpers, active_profile, capture_all / restore_all
 #   - run_fzf                      : wraps the shared fzf flag set
 #
@@ -19,6 +19,13 @@
 #   slot_<s>_restore     <profile_dir>  <profile_dir>/<s>.json -> live state
 #   slot_<s>_identity                   fingerprint of live state ("" if none)
 #   slot_<s>_identity_of <profile_dir>  same fingerprint read from the saved file
+# A slot may also define a fifth, optional function:
+#   slot_<s>_preflight                  refuse the whole operation before it
+#                                       starts ("" = nothing to check)
+# `preflight_all` runs every one of them before any slot writes anything, so a
+# slot that cannot safely be swapped right now aborts the command instead of
+# leaving half the state switched.
+#
 # The first slot in SLOTS decides which profile counts as "active". Adding a
 # settings or plugins slot later means writing those four functions and
 # appending the name to SLOTS; cswap.sh never names a slot directly.
@@ -91,6 +98,16 @@ json_write_atomic() {
 json_read() { jq . "$1" 2>/dev/null || echo '{}'; }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# base64: BSD spells decode -D and GNU -d (newer macOS takes both). Probe, and
+# never emit line breaks, so the result survives a round trip through JSON.
+b64_encode() { base64 | tr -d '\n'; }
+b64_decode() {
+  if [ -z "${_B64_DECODE:-}" ]; then
+    if printf 'aGk=' | base64 -d >/dev/null 2>&1; then _B64_DECODE="-d"; else _B64_DECODE="-D"; fi
+  fi
+  base64 "$_B64_DECODE"
+}
 
 # --- credential store ---------------------------------------------------------
 # Claude Code keeps the OAuth blob in one of two places, and which one is live
@@ -212,7 +229,7 @@ creds_location() {
 # .credentials.json also holds MCP OAuth tokens and .claude.json holds ~90 keys
 # of UI state that should stay shared across accounts.
 
-SLOTS=(login)
+SLOTS=(login desktop)
 
 slot_login_identity() {
   json_read "$(claude_json_file)" | jq -r '.oauthAccount.accountUuid // empty'
@@ -251,6 +268,103 @@ slot_login_restore() {
   json_read "$(claude_json_file)" \
     | jq --argjson s "$saved" '.oauthAccount = $s.account | .userID = $s.userID' \
     | json_write_atomic "$(claude_json_file)"
+}
+
+# --- slot: desktop -----------------------------------------------------------
+# What it swaps: the Claude desktop app's signed-in account. That app is an
+# Electron shell around claude.ai, so its login is a web session, not the OAuth
+# blob the CLI uses:
+#   Cookies                    the sessionKey cookie for .claude.ai (SQLite)
+#   config.json                lastKnownAccountUuid, oauth:tokenCache[V2]
+#   ant-device-registry.json   this account's device registration
+# The two oauth:tokenCache values are "v10:" Electron safeStorage blobs,
+# encrypted under the app-wide "Claude Safe Storage" keychain key rather than a
+# per-account one, so they move verbatim: cswap never decrypts them and never
+# asks the keychain for that key. Everything else in the app's support
+# directory — caches, window state, MCP config, conversation storage — is left
+# alone, the same way the login slot leaves the other 90 keys of .claude.json.
+#
+# The slot is a no-op when the app is not installed, when it has never been
+# signed in, or when CSWAP_NO_DESKTOP is set (switch the CLI only).
+
+desktop_dir()      { echo "${CSWAP_DESKTOP_DIR:-$HOME/Library/Application Support/Claude}"; }
+desktop_config()   { echo "$(desktop_dir)/config.json"; }
+desktop_cookies()  { echo "$(desktop_dir)/Cookies"; }
+desktop_registry() { echo "$(desktop_dir)/ant-device-registry.json"; }
+
+desktop_enabled() { [ -z "${CSWAP_NO_DESKTOP:-}" ] && [ -d "$(desktop_dir)" ]; }
+
+# desktop_running: Electron keeps cookies in memory and rewrites them on quit,
+# so anything we write under a live app is overwritten without warning.
+desktop_running() {
+  if [ -n "${CSWAP_DESKTOP_RUNNING:-}" ]; then [ "$CSWAP_DESKTOP_RUNNING" = 1 ]; return; fi
+  pgrep -f 'Claude\.app/Contents/MacOS/Claude' >/dev/null 2>&1
+}
+
+slot_desktop_preflight() {
+  desktop_enabled || return 0
+  desktop_running || return 0
+  echo "the Claude desktop app is running; quit it first (it rewrites its login on exit)" >&2
+  echo "  or set CSWAP_NO_DESKTOP=1 to switch only the Claude Code login" >&2
+  return 1
+}
+
+slot_desktop_identity() {
+  desktop_enabled || return 0
+  json_read "$(desktop_config)" | jq -r '.lastKnownAccountUuid // empty'
+}
+
+slot_desktop_identity_of() {
+  json_read "$1/desktop.json" | jq -r '.accountUuid // empty'
+}
+
+slot_desktop_capture() {
+  local dir="$1" cfg uuid cookies=""
+  desktop_enabled || return 0
+  cfg="$(json_read "$(desktop_config)")"
+  uuid="$(echo "$cfg" | jq -r '.lastKnownAccountUuid // empty')"
+  # Installed but never signed in: nothing to save, and not an error — the CLI
+  # login is what the user asked to save.
+  [ -n "$uuid" ] || return 0
+  [ -f "$(desktop_cookies)" ] && cookies="$(b64_encode < "$(desktop_cookies)")"
+  ensure_profiles_dir
+  mkdir -p "$dir" && chmod 700 "$dir"
+  jq -n --arg u "$uuid" \
+        --argjson c "$(echo "$cfg" | jq '{"oauth:tokenCache", "oauth:tokenCacheV2"}')" \
+        --argjson r "$(json_read "$(desktop_registry)")" \
+        --arg ck "$cookies" --arg t "$(now_iso)" \
+        '{accountUuid: $u, config: $c, registry: $r, cookies: $ck, savedAt: $t}' \
+    | json_write_atomic "$dir/desktop.json"
+}
+
+slot_desktop_restore() {
+  local dir="$1" saved
+  desktop_enabled || return 0
+  # A profile saved before the desktop app existed (or on a machine without it)
+  # simply has no desktop half; switching the CLI login is still correct.
+  [ -f "$dir/desktop.json" ] || return 0
+  saved="$(json_read "$dir/desktop.json")"
+  [ "$(echo "$saved" | jq -r '.accountUuid // empty')" ] || {
+    echo "profile has no saved desktop login: $dir/desktop.json" >&2
+    return 1
+  }
+  json_read "$(desktop_config)" \
+    | jq --argjson s "$saved" '. + $s.config | .lastKnownAccountUuid = $s.accountUuid' \
+    | json_write_atomic "$(desktop_config)"
+  # Merge, not replace: the registry can hold an entry per account and the
+  # others are still valid.
+  json_read "$(desktop_registry)" \
+    | jq --argjson s "$saved" '. + $s.registry' \
+    | json_write_atomic "$(desktop_registry)"
+  if [ -n "$(echo "$saved" | jq -r '.cookies // empty')" ]; then
+    local tmp; tmp="$(mktemp "$(desktop_dir)/.cswap.XXXXXX")"
+    echo "$saved" | jq -r '.cookies' | b64_decode > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$(desktop_cookies)"
+    # A leftover journal or WAL would replay rows from the login we just
+    # replaced. The app rebuilds both on next launch.
+    rm -f "$(desktop_cookies)-journal" "$(desktop_cookies)-wal" "$(desktop_cookies)-shm"
+  fi
 }
 
 # --- profiles ----------------------------------------------------------------
@@ -294,6 +408,32 @@ active_profile() {
       return 0
     fi
   done < <(profile_list)
+}
+
+# preflight_all: give every slot that defines a preflight the chance to refuse
+# before anything is written. Called by cswap.sh ahead of any command that
+# changes live state.
+# slots_out_of_sync: names of the slots whose live identity disagrees with the
+# first slot's — the desktop app signed in as someone else, say. For humans;
+# cswap.sh prints the names without knowing what they mean.
+slots_out_of_sync() {
+  local s first other
+  first="$("slot_${SLOTS[0]}_identity")" || return 0
+  [ -n "$first" ] || return 0
+  for s in "${SLOTS[@]:1}"; do
+    other="$("slot_${s}_identity")" || other=""
+    if [ -n "$other" ] && [ "$other" != "$first" ]; then echo "$s"; fi
+  done
+  return 0
+}
+
+preflight_all() {
+  local s rc=0
+  for s in "${SLOTS[@]}"; do
+    declare -F "slot_${s}_preflight" >/dev/null || continue
+    "slot_${s}_preflight" || rc=1
+  done
+  return "$rc"
 }
 
 capture_all() {

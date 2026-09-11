@@ -41,6 +41,7 @@ new_sandbox() {
   SANDBOX="$(mktemp -d)"
   export CSWAP_HOME="$SANDBOX/cswap" CLAUDE_CONFIG_DIR="$SANDBOX/claude"
   export CSWAP_CREDS_STORE=file   # never reach for the real keychain in tests
+  export CSWAP_DESKTOP_DIR="$SANDBOX/desktop" CSWAP_DESKTOP_RUNNING=0   # no desktop app unless a test makes one
   mkdir -p "$CLAUDE_CONFIG_DIR"
 }
 
@@ -357,6 +358,35 @@ test_new_refuses_existing_name() {
   run new work
   assert_exit_code "$RC" 1 || return 1
   assert_contains "$ERR" "already exists" || return 1
+}
+
+test_switch_refuses_while_the_desktop_app_runs() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com; run add work
+  mkdir -p "$CSWAP_DESKTOP_DIR"
+  echo '{"lastKnownAccountUuid":"u1"}' > "$CSWAP_DESKTOP_DIR/config.json"
+  make_live u2 two@example.com; run add personal
+  export CSWAP_DESKTOP_RUNNING=1
+  run work
+  assert_exit_code "$RC" 1 || return 1
+  assert_contains "$ERR" "quit it first" || return 1
+  assert_eq "$(live_uuid)" "u2" "live login untouched" || return 1
+  # the escape hatch still switches the CLI
+  CSWAP_NO_DESKTOP=1 run work
+  assert_exit_code "$RC" 0 || return 1
+  assert_eq "$(live_uuid)" "u1" "CLI switched with --no-desktop" || return 1
+  unset CSWAP_DESKTOP_RUNNING
+}
+
+test_status_notes_a_desktop_on_another_account() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com; run add work
+  mkdir -p "$CSWAP_DESKTOP_DIR"
+  echo '{"lastKnownAccountUuid":"u9"}' > "$CSWAP_DESKTOP_DIR/config.json"
+  run status
+  assert_exit_code "$RC" 0 || return 1
+  assert_eq "$OUT" "work (one@example.com)" "stdout stays data" || return 1
+  assert_contains "$ERR" "the desktop login is a different account" || return 1
 }
 
 # --- runner ------------------------------------------------------------------

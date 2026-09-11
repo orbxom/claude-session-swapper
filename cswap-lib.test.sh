@@ -47,6 +47,7 @@ new_sandbox() {
   SANDBOX="$(mktemp -d)"
   export CSWAP_HOME="$SANDBOX/cswap" CLAUDE_CONFIG_DIR="$SANDBOX/claude"
   export CSWAP_CREDS_STORE=file   # keychain backend has its own tests below
+  export CSWAP_DESKTOP_DIR="$SANDBOX/desktop" CSWAP_DESKTOP_RUNNING=0   # no desktop app unless a test makes one
   mkdir -p "$CLAUDE_CONFIG_DIR"
 }
 
@@ -308,6 +309,109 @@ EOF
   local rc=0; capture_all work 2>/dev/null || rc=$?
   assert_exit_code "$rc" 1 || return 1
   [ ! -e "$CSWAP_HOME/profiles/work/login.json" ] || { echo "  FAIL wrote a profile while logged out"; return 1; }
+}
+
+# --- slot: desktop -----------------------------------------------------------
+
+# make_desktop <uuid> [<cookie payload>]: a stand-in for the Claude desktop
+# app's data dir. The Cookies file is opaque to cswap (an encrypted SQLite DB
+# in real life), so a plain string proves the round trip just as well.
+make_desktop() {
+  sandboxed_or_die
+  local uuid="$1" cookie="${2:-cookie-$1}"
+  mkdir -p "$CSWAP_DESKTOP_DIR"
+  cat > "$CSWAP_DESKTOP_DIR/config.json" <<EOF
+{"locale":"en-US","windowSizeWasSignedIn":true,
+ "lastKnownAccountUuid":"$uuid",
+ "oauth:tokenCache":"v10:tc-$uuid","oauth:tokenCacheV2":"v10:tc2-$uuid"}
+EOF
+  echo "{\"$uuid\":\"pk1:dev-$uuid\"}" > "$CSWAP_DESKTOP_DIR/ant-device-registry.json"
+  printf '%s' "$cookie" > "$CSWAP_DESKTOP_DIR/Cookies"
+}
+
+test_desktop_slot_is_inert_without_the_app() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com
+  assert_eq "$(slot_desktop_identity)" "" "no identity" || return 1
+  capture_all solo || return 1
+  [ ! -e "$CSWAP_HOME/profiles/solo/desktop.json" ] || { echo "  FAIL wrote desktop.json with no app"; return 1; }
+  restore_all solo || return 1
+  assert_eq "$(slot_login_identity)" "u1" "login still swapped" || return 1
+}
+
+test_desktop_capture_and_restore_round_trip() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com; make_desktop u1 'cookie-blob-one'
+  capture_all personal || return 1
+  local f="$CSWAP_HOME/profiles/personal/desktop.json"
+  assert_eq "$(file_mode "$f")" "600" "mode" || return 1
+  assert_eq "$(jq -r '.accountUuid' "$f")" "u1" "uuid" || return 1
+  assert_eq "$(jq -r '."config"."oauth:tokenCacheV2"' "$f")" "v10:tc2-u1" "token cache saved" || return 1
+
+  # the app is now signed in as somebody else
+  make_live u2 two@example.com; make_desktop u2 'cookie-blob-two'
+  restore_all personal || return 1
+  assert_eq "$(slot_desktop_identity)" "u1" "uuid restored" || return 1
+  assert_eq "$(cat "$CSWAP_DESKTOP_DIR/Cookies")" "cookie-blob-one" "cookies restored" || return 1
+  assert_eq "$(jq -r '."oauth:tokenCache"' "$CSWAP_DESKTOP_DIR/config.json")" "v10:tc-u1" "token cache restored" || return 1
+  assert_eq "$(jq -r '.locale' "$CSWAP_DESKTOP_DIR/config.json")" "en-US" "other config keys kept" || return 1
+  assert_eq "$(jq -r '.windowSizeWasSignedIn' "$CSWAP_DESKTOP_DIR/config.json")" "true" "other config keys kept" || return 1
+  assert_eq "$(jq -r '.["u2"]' "$CSWAP_DESKTOP_DIR/ant-device-registry.json")" "pk1:dev-u2" "other accounts keep their registration" || return 1
+  assert_eq "$(jq -r '.["u1"]' "$CSWAP_DESKTOP_DIR/ant-device-registry.json")" "pk1:dev-u1" "restored registration" || return 1
+}
+
+test_desktop_restore_clears_a_stale_cookie_journal() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com; make_desktop u1
+  capture_all personal || return 1
+  make_desktop u2
+  : > "$CSWAP_DESKTOP_DIR/Cookies-journal"
+  : > "$CSWAP_DESKTOP_DIR/Cookies-wal"
+  restore_all personal || return 1
+  [ ! -e "$CSWAP_DESKTOP_DIR/Cookies-journal" ] || { echo "  FAIL left a journal that would replay the old login"; return 1; }
+  [ ! -e "$CSWAP_DESKTOP_DIR/Cookies-wal" ] || { echo "  FAIL left a WAL"; return 1; }
+}
+
+test_desktop_capture_skips_an_app_never_signed_in() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com
+  mkdir -p "$CSWAP_DESKTOP_DIR"
+  echo '{"locale":"en-US"}' > "$CSWAP_DESKTOP_DIR/config.json"
+  capture_all work || return 1
+  [ ! -e "$CSWAP_HOME/profiles/work/desktop.json" ] || { echo "  FAIL saved a desktop login that does not exist"; return 1; }
+}
+
+test_desktop_restore_skips_a_profile_saved_without_it() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com
+  capture_all old-profile || return 1          # saved before the app existed
+  make_desktop u2
+  restore_all old-profile || return 1
+  assert_eq "$(slot_desktop_identity)" "u2" "desktop left alone" || return 1
+  assert_eq "$(slot_login_identity)" "u1" "login still restored" || return 1
+}
+
+test_desktop_preflight_refuses_while_the_app_runs() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com; make_desktop u1
+  CSWAP_DESKTOP_RUNNING=0 preflight_all || { echo "  FAIL refused while the app was closed"; return 1; }
+  local rc=0 err
+  err="$(CSWAP_DESKTOP_RUNNING=1 preflight_all 2>&1)" || rc=$?
+  assert_exit_code "$rc" 1 "refuses" || return 1
+  assert_contains "$err" "quit it first" || return 1
+  assert_contains "$err" "CSWAP_NO_DESKTOP" "offers the escape hatch" || return 1
+  rc=0; CSWAP_DESKTOP_RUNNING=1 CSWAP_NO_DESKTOP=1 preflight_all 2>/dev/null || rc=$?
+  assert_exit_code "$rc" 0 "CSWAP_NO_DESKTOP opts out" || return 1
+}
+
+test_slots_out_of_sync_reports_a_mismatched_desktop() {
+  new_sandbox; trap "rm -rf '$SANDBOX'" RETURN
+  make_live u1 one@example.com; make_desktop u1
+  assert_eq "$(slots_out_of_sync)" "" "in sync" || return 1
+  make_desktop u2
+  assert_eq "$(slots_out_of_sync)" "desktop" "desktop on another account" || return 1
+  make_logged_out
+  assert_eq "$(slots_out_of_sync)" "" "nothing to compare when logged out" || return 1
 }
 
 # --- runner ------------------------------------------------------------------
